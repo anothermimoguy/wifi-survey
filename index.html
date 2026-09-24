@@ -1,0 +1,239 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wi-Fi Survey Map</title>
+<link href="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.css" rel="stylesheet">
+<style>html,body{height:100%;margin:0}#map{height:100%;position:relative;overflow:hidden}#panel{position:absolute;z-index:2;top:12px;left:12px;background:#fff;padding:12px;border-radius:10px;box-shadow:0 2px 12px #0003;font:14px system-ui;max-width:330px}select{padding:4px}#legend{margin-top:8px}.sw{display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:3px}</style></head>
+<body><div id="map"></div><div id="panel"><b>Wi-Fi Survey</b><br>Measurements: 4<br>
+<label>Colour by <select id="metric"><option>RSSI</option><option>SNR</option><option>RX Rate</option><option>TX Rate</option></select></label><br><label>Heatmap radius <input id="radius" type="range" min="5" max="80" value="25"> <span id="radiusValue">25 m</span> <small style="color:#666">(20 dB predicted edge fall-off)</small></label><br><label><input id="heatmap" type="checkbox" checked> Predictive heatmap</label>
+<div id="legend"></div><small>Coordinates are plotted directly from Latitude/Longitude in the CSV.</small></div>
+<script src="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.js"></script>
+<script>
+let data = [];
+
+function parseCSV(text){
+  const rows=[];
+  let row=[], field='', quoted=false;
+  for(let i=0;i<text.length;i++){
+    const c=text[i];
+    if(c==='"'){
+      if(quoted && text[i+1]==='"'){ field+='"'; i++; }
+      else quoted=!quoted;
+    }else if(c===',' && !quoted){
+      row.push(field); field='';
+    }else if((c==='\n' || c==='\r') && !quoted){
+      if(c==='\r' && text[i+1]==='\n') i++;
+      row.push(field); field='';
+      if(row.some(x=>x.trim()!=='')) rows.push(row);
+      row=[];
+    }else field+=c;
+  }
+  if(field!=='' || row.length){
+    row.push(field);
+    if(row.some(x=>x.trim()!=='')) rows.push(row);
+  }
+  return rows;
+}
+
+function csvData(text){
+  const rows=parseCSV(text);
+  if(!rows.length) return [];
+  const headers=rows[0].map(h=>h.trim());
+  const idx={}; headers.forEach((h,i)=>idx[h]=i);
+  const get=(r,...names)=>{
+    for(const n of names){
+      if(idx[n]!==undefined) return (r[idx[n]]??'').trim();
+    }
+    return '';
+  };
+  return rows.slice(1).map(r=>{
+    const d={
+      'Measurement ID':get(r,'Measurement ID','measurement_id','timestamp'),
+      'Timestamp':get(r,'Timestamp','timestamp'),
+      'Latitude':get(r,'Latitude','latitude'),
+      'Longitude':get(r,'Longitude','longitude'),
+      'SSID':get(r,'SSID','ssid'),
+      'BSSID':get(r,'BSSID','MAC','bssid','mac'),
+      'WiFi Standard':get(r,'WiFi Standard','Wi-Fi Standard','protocol'),
+      'WiFi Generation':get(r,'WiFi Generation','Wi-Fi Generation'),
+      'Band':get(r,'Band','frequency'),
+      'Channel':get(r,'Channel','channel'),
+      'RSSI':get(r,'RSSI','Signal Strength (dBm)','signal_strength'),
+      'Noise':get(r,'Noise','Noise Level (dBm','noise_level'),
+      'SNR':get(r,'SNR','quality'),
+      'RX Rate':get(r,'RX Rate','rx_rate'),
+      'TX Rate':get(r,'TX Rate','tx_rate'),
+      'Local IP':get(r,'Local IP','local_ip'),
+      'Public IP':get(r,'Public IP','public_ip'),
+      'Device':get(r,'Device','Device Type','device_type'),
+      'iOS Version':get(r,'iOS Version','Firmware Version','firmware_version')
+    };
+    for(const k of ['Latitude','Longitude','Channel','RSSI','Noise','SNR','RX Rate','TX Rate']){
+      const n=Number(d[k]); d[k+'_num']=Number.isFinite(n)?n:null;
+    }
+    d._lat=d.Latitude_num; d._lon=d.Longitude_num;
+    return d;
+  }).filter(d=>Number.isFinite(d._lat)&&Number.isFinite(d._lon));
+}
+
+async function loadSurveyData(){
+  const url='WiFi_Survey.csv?ts='+Date.now();
+  const res=await fetch(url,{cache:'no-store'});
+  if(!res.ok) throw new Error('WiFi_Survey.csv could not be loaded ('+res.status+')');
+  return csvData(await res.text());
+}
+
+const map=new maplibregl.Map({container:'map',style:'https://tiles.openfreemap.org/styles/liberty',center:[-0.0624574079039872,51.4141422168515],zoom:18});
+map.addControl(new maplibregl.NavigationControl());
+function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+function color(metric,v){if(v==null||!isFinite(v))return '#777';if(metric==='RSSI')return v>=-60?'#2ca02c':v>=-67?'#8bc34a':v>=-72?'#f1c40f':v>=-77?'#e67e22':'#d62728';if(metric==='SNR')return v>=30?'#2ca02c':v>=20?'#8bc34a':v>=15?'#f1c40f':v>=10?'#e67e22':'#d62728';let vals=data.map(x=>x[metric+'_num']).filter(x=>x!=null),min=Math.min(...vals),max=Math.max(...vals),t=max===min?1:(v-min)/(max-min);return t>=.75?'#2ca02c':t>=.5?'#8bc34a':t>=.25?'#f1c40f':'#d62728';}
+function render(){document.querySelectorAll('.survey-marker').forEach(e=>e.remove());let metric=document.getElementById('metric').value;data.forEach(d=>{let el=document.createElement('div');el.className='survey-marker';el.style.cssText=`width:16px;height:16px;border-radius:50%;background:${color(metric,d[metric+'_num'])};border:2px solid #222;box-sizing:border-box;cursor:pointer`;new maplibregl.Marker({element:el}).setLngLat([d._lon,d._lat]).setPopup(new maplibregl.Popup().setHTML('<b>Wi-Fi Measurement</b><br>'+['Measurement ID','Timestamp','SSID','BSSID','WiFi Standard','WiFi Generation','Band','Channel','RSSI','Noise','SNR','RX Rate','TX Rate','Local IP','Public IP','Device','iOS Version'].map(f=>d[f]!=null?'<b>'+esc(f)+'</b>: '+esc(d[f])+'<br>':'').join(''))).addTo(map);});document.getElementById('legend').innerHTML=metric==='RSSI'?'🟢 ≥-60 &nbsp; 🟢 -61–-67 &nbsp; 🟡 -68–-72 &nbsp; 🟠 -73–-77 &nbsp; 🔴 <-77':metric==='SNR'?'🟢 ≥30 &nbsp; 🟢 20–29 &nbsp; 🟡 15–19 &nbsp; 🟠 10–14 &nbsp; 🔴 <10':'🟢 Higher → 🔴 Lower';}
+async function startSurvey(){
+  try{
+    data=await loadSurveyData();
+    if(!data.length) throw new Error('WiFi_Survey.csv contains no valid measurements.');
+    map.on('load',()=>{
+      render();
+      if(data.length>1){
+        let b=new maplibregl.LngLatBounds();
+        data.forEach(d=>b.extend([d._lon,d._lat]));
+        map.fitBounds(b,{padding:80,maxZoom:19});
+      }else{
+        map.setCenter([data[0]._lon,data[0]._lat]);
+      }
+      if(typeof window.__heatReady==='function') window.__heatReady();
+    });
+    document.getElementById('metric').onchange=render;
+  }catch(err){
+    console.error(err);
+    const box=document.createElement('div');
+    box.style.cssText='position:absolute;top:70px;left:50%;transform:translateX(-50%);z-index:20;background:#fff;color:#111;padding:12px 16px;border-radius:8px;box-shadow:0 2px 10px #0004;font:14px system-ui;max-width:90%;';
+    box.innerHTML='<b>Survey data error</b><br>'+esc(err.message)+'<br><small>Make sure WiFi_Survey.csv is in the same GitHub repository as index.html.</small>';
+    document.body.appendChild(box);
+  }
+}
+startSurvey();
+</script>
+
+<style>
+#map #heatCanvas{
+  position:absolute;
+  inset:0;
+  width:100%;
+  height:100%;
+  z-index:1;
+  pointer-events:none;
+}
+#map .maplibregl-canvas-container{z-index:0}
+#map .maplibregl-control-container{z-index:5}
+#map .maplibregl-marker{z-index:3}
+#map .maplibregl-popup{z-index:4}
+</style>
+<script>
+(function(){
+  const mapEl=document.getElementById('map');
+  const canvas=document.createElement('canvas');
+  canvas.id='heatCanvas';
+  mapEl.appendChild(canvas);
+  const ctx=canvas.getContext('2d');
+
+  const radiusEl=document.getElementById('radius');
+  const radiusValue=document.getElementById('radiusValue');
+  const heatEl=document.getElementById('heatmap');
+  let ready=false, raf=0;
+
+  function resize(){
+    if(!ready)return;
+    const dpr=window.devicePixelRatio||1,w=mapEl.clientWidth,h=mapEl.clientHeight;
+    canvas.width=Math.max(1,Math.round(w*dpr));
+    canvas.height=Math.max(1,Math.round(h*dpr));
+    canvas.style.width=w+'px';
+    canvas.style.height=h+'px';
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    drawHeat();
+  }
+
+  function metersToPixels(m){
+    const c=map.getCenter(),a=map.project(c);
+    const lonDelta=m/(111320*Math.cos(c.lat*Math.PI/180));
+    const b=map.project([c.lng+lonDelta,c.lat]);
+    return Math.max(2,Math.abs(b.x-a.x));
+  }
+
+  function valueAt(x,y,metric,rpx){
+    let num=0,den=0,has=false;
+    for(const p of data){
+      const v=Number(p[metric+'_num']);
+      if(!Number.isFinite(v))continue;
+      const q=map.project([p._lon,p._lat]),d=Math.hypot(x-q.x,y-q.y);
+      if(d>rpx)continue;
+      has=true;
+      if(d<1)return v;
+      const t=Math.min(1,d/rpx);
+      const attenuation=metric==='RSSI'?20*Math.pow(t,1.35):0;
+      const w=1/(d*d);
+      num+=w*(v-attenuation);
+      den+=w;
+    }
+    return has&&den?num/den:null;
+  }
+
+  function rgbaFor(v,metric,alpha){
+    if(v==null)return null;
+    if(metric==='RSSI'){
+      const t=Math.max(0,Math.min(1,(-v-45)/45));
+      let r,g,b;
+      if(t<.5){
+        const u=t/.5;
+        r=Math.round(40+(245-40)*u);g=Math.round(190+(210-190)*u);b=Math.round(80+(55-80)*u);
+      }else{
+        const u=(t-.5)/.5;
+        r=Math.round(245+(215-245)*u);g=Math.round(210+(45-210)*u);b=Math.round(55+(45-55)*u);
+      }
+      return `rgba(${r},${g},${b},${alpha})`;
+    }
+    if(metric==='SNR'){
+      if(v>=30)return `rgba(40,190,80,${alpha})`;
+      if(v>=20)return `rgba(130,205,75,${alpha})`;
+      if(v>=15)return `rgba(245,210,55,${alpha})`;
+      if(v>=10)return `rgba(240,130,35,${alpha})`;
+      return `rgba(215,45,45,${alpha})`;
+    }
+    const vals=data.map(d=>Number(d[metric+'_num'])).filter(Number.isFinite);
+    const mn=Math.min(...vals),mx=Math.max(...vals),t=mx===mn?.5:(v-mn)/(mx-mn);
+    if(t>=.75)return `rgba(40,190,80,${alpha})`;
+    if(t>=.5)return `rgba(130,205,75,${alpha})`;
+    if(t>=.25)return `rgba(245,210,55,${alpha})`;
+    return `rgba(215,45,45,${alpha})`;
+  }
+
+  function drawHeat(){
+    if(!ready)return;
+    cancelAnimationFrame(raf);
+    raf=requestAnimationFrame(()=>{
+      const w=mapEl.clientWidth,h=mapEl.clientHeight;
+      ctx.clearRect(0,0,w,h);
+      if(!heatEl.checked||!data.length)return;
+      const metric=document.getElementById('metric').value,rpx=metersToPixels(Number(radiusEl.value)),step=4;
+      for(let y=0;y<h;y+=step)for(let x=0;x<w;x+=step){
+        const cx=x+step/2,cy=y+step/2,v=valueAt(cx,cy,metric,rpx);
+        if(v==null)continue;
+        let near=Infinity;
+        for(const p of data){
+          const q=map.project([p._lon,p._lat]);
+          near=Math.min(near,Math.hypot(cx-q.x,cy-q.y));
+        }
+        const edge=Math.max(0,1-near/rpx),c=rgbaFor(v,metric,.07+.33*edge*edge);
+        if(c){ctx.fillStyle=c;ctx.fillRect(x,y,step,step);}
+      }
+    });
+  }
+
+  radiusEl.addEventListener('input',()=>{radiusValue.textContent=radiusEl.value+' m';drawHeat();});
+  heatEl.addEventListener('change',drawHeat);
+  document.getElementById('metric').addEventListener('change',drawHeat);
+  window.addEventListener('resize',resize);
+  map.on('load',()=>{ready=true;resize();drawHeat();});
+  map.on('move',drawHeat);
+  map.on('zoom',drawHeat);
+})();
+</script>
+</body></html>
